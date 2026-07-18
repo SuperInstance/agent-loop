@@ -1,0 +1,154 @@
+# flock.yaml — Model Flock Configuration
+# 
+# This file configures the collection of tiny models that the autonomous
+# agent can load and unload. The smallest model (iterator) runs permanently.
+# Specialists are loaded on demand within the VRAM budget.
+#
+# Edit this file to match your hardware. The default assumes an RTX 4050
+# laptop with 6GB VRAM + shared RAM fallback.
+
+# ═══════════════════════════════════════════════════════════════
+# VRAM Budget
+# ═══════════════════════════════════════════════════════════════
+
+vram_budget_gb: 6.0        # RTX 4050 = 6GB. Set to 8 for 4060, 12 for 4070.
+
+# Allow fallback to system RAM (slower but can run bigger models)
+allow_ram_fallback: true
+ram_budget_gb: 16.0        # Total system RAM to budget for models
+
+# ═══════════════════════════════════════════════════════════════
+# Iterator (always loaded)
+# ═══════════════════════════════════════════════════════════════
+
+iterator:
+  model: qwen2.5:0.5b
+  num_ctx: 4096
+  temperature: 0.3
+  max_tokens: 150
+
+# ═══════════════════════════════════════════════════════════════
+# Escalation Policy
+# ═══════════════════════════════════════════════════════════════
+
+escalation:
+  # How many consecutive failures before escalating?
+  failure_threshold: 2
+  
+  # Patterns in iterator output that trigger escalation
+  triggers:
+    - "i'm not sure"
+    - "i don't know"
+    - "this is complex"
+    - "requires deeper"
+    - "escalate:"
+    - "need specialist"
+  
+  # When the specialist finishes, keep it loaded for N seconds
+  # in case there's a follow-up question (Ollama keep_alive)
+  keep_alive_seconds: 300
+
+# ═══════════════════════════════════════════════════════════════
+# Specialist Roster
+# 
+# Comment out models you haven't pulled or don't want.
+# The router will skip unavailable models automatically.
+# ═══════════════════════════════════════════════════════════════
+
+specialists:
+  # ── Tier 1: Fast (<3s to load) ─────────────────────────────
+  
+  - name: qwen2.5-coder:1.5b
+    tag: fast-coder
+    specialty: coding
+    vram_gb: 1.2
+    speed_rank: 2
+    strengths: [code_generation, code_review, syntax_fixes, test_writing]
+    description: "Fast code gen for boilerplate and simple fixes"
+  
+  - name: deepseek-r1:1.5b
+    tag: fast-thinker
+    specialty: reasoning
+    vram_gb: 1.2
+    speed_rank: 3
+    strengths: [step_by_step_reasoning, math, logic, debugging]
+    description: "Chain-of-thought reasoning on a budget"
+  
+  - name: gemma2:2b
+    tag: generalist
+    specialty: general
+    vram_gb: 1.8
+    speed_rank: 4
+    strengths: [general_qa, summarization, explanation, translation]
+    description: "Google's small model — well-rounded fallback"
+  
+  # ── Tier 2: Medium (~5s to load) ───────────────────────────
+  
+  - name: qwen2.5-coder:3b
+    tag: coder
+    specialty: coding
+    vram_gb: 2.5
+    speed_rank: 5
+    strengths: [code_generation, architecture, refactoring, debugging]
+    description: "The workhorse coder"
+  
+  - name: qwen2.5:3b
+    tag: thinker
+    specialty: reasoning
+    vram_gb: 2.5
+    speed_rank: 6
+    strengths: [planning, analysis, reasoning, writing]
+    description: "General reasoning and planning"
+  
+  - name: phi3:3.8b
+    tag: scholar
+    specialty: reasoning
+    vram_gb: 3.0
+    speed_rank: 7
+    strengths: [math, logic, structured_analysis]
+    description: "Microsoft Phi-3 — punches above its weight"
+  
+  # ── Tier 3: Heavy (~10s to load) ───────────────────────────
+  # These need ~5GB VRAM. Only load when the task is hard.
+  
+  - name: qwen2.5-coder:7b
+    tag: architect
+    specialty: coding
+    vram_gb: 5.0
+    speed_rank: 9
+    strengths: [complex_architecture, multi_file_reasoning, system_design]
+    description: "Senior engineer for complex architecture"
+  
+  - name: deepseek-r1:7b
+    tag: sage
+    specialty: reasoning
+    vram_gb: 5.0
+    speed_rank: 10
+    strengths: [deep_reasoning, math_proofs, edge_case_analysis]
+    description: "The wise elder — slow but thorough"
+  
+  - name: mistral:7b
+    tag: general-heavy
+    specialty: general
+    vram_gb: 5.0
+    speed_rank: 9
+    strengths: [instruction_following, general_qa, writing, analysis]
+    description: "Reliable general-purpose workhorse"
+  
+  # ── Tier 4: Multimodal ─────────────────────────────────────
+  
+  - name: qwen2.5-vl:3b
+    tag: eyes
+    specialty: vision
+    vram_gb: 2.5
+    speed_rank: 6
+    strengths: [image_understanding, screenshot_analysis, ui_inspection]
+    description: "Lightweight vision-language model"
+  
+  - name: llava:7b
+    tag: watchman
+    specialty: vision
+    vram_gb: 5.0
+    speed_rank: 10
+    strengths: [detailed_image_analysis, ocr, visual_reasoning]
+    description: "Heavy vision model for complex image analysis"
