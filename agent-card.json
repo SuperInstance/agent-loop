@@ -1,0 +1,73 @@
+{
+  "$comment": "Machine-readable trust & capability manifest for agent-loop v2.0. Every fact is checkable; verification commands included. Inspired by A2A agent cards, adapted for a local-first repo.",
+  "name": "agent-loop",
+  "version": "2.0.0",
+  "summary": "Minimal local self-improving pair-programming loop. One stdlib-only Python file; learns persistent style corrections via a file-based memory. No accounts, no cloud, no telemetry.",
+  "maturity": "experimental / playground-grade",
+  "license": "UNLICENSED — add a LICENSE file before publishing",
+
+  "requirements": {
+    "python": ">=3.9",
+    "runtime_dependencies": 0,
+    "model_server": "Ollama on localhost:11434",
+    "model_recommended": "qwen2.5-coder:3b (~2 GB)",
+    "model_minimum": "qwen2.5-coder:1.5b (~1 GB)"
+  },
+
+  "trust_facts": {
+    "network_egress": ["http://localhost:11434"],
+    "shell_execution": "none",
+    "eval_of_generated_text": "none",
+    "telemetry": "none",
+    "accounts": "none",
+    "files_read": ["workspace.md", "stream.md", "quest.md (optional)", "preferences.jsonl (at boot)"],
+    "files_written": ["workspace.md (template only)", "stream.md", "preferences.jsonl (append-only)"],
+    "process_model": "single process; extras are separate, optional processes",
+    "memory_footprint_mb_typical": 15,
+    "cpu_pattern": "one file stat per second when idle"
+  },
+
+  "capabilities": [
+    "file-protocol turn-taking between human and local model",
+    "persistent style memory (prompt rules now, Alpaca JSONL for later fine-tuning)",
+    "explicit steering commands (!fix !note !step !pause !resume !clear)",
+    "code-enforced anti-repetition with hot retry",
+    "optional quest.md intake for Director-style agents"
+  ],
+
+  "non_goals": [
+    "autocomplete (use Copilot/Continue/CodeGeeX, or extras/reflex.py)",
+    "tool execution in the core",
+    "cloud sync, accounts, telemetry",
+    "replacing agentic coding tools"
+  ],
+
+  "optional_extras": [
+    {"path": "extras/reflex.py", "purpose": "local CodeGeeX stand-in; expands micro-steps into code blocks", "dependencies": 0},
+    {"path": "extras/conductor_driver.py", "purpose": "scripted-human test harness", "dependencies": 0}
+  ],
+
+  "verification": {
+    "imports": "grep -E \"^import |^from \" loop.py",
+    "network": "grep -n \"http\" loop.py",
+    "no_shell": "grep -nE \"subprocess|os\\.system|eval\\(|exec\\(\" loop.py",
+    "core_size": "wc -l loop.py",
+    "test_evidence": ["SESSION_REPORT.md", "session-logs/"]
+  },
+
+  "known_limitations": [
+    "small local models repeat and drift; anti-repeat catches exact/normalized duplicates only",
+    "one loop process per directory (enforced by convention, not lock)",
+    "commands fire once per unique text per process lifetime",
+    "no semantic dedup, no tool execution, no planning layer (quest.md is read but not decomposed)"
+  ],
+
+  "docs": {
+    "user": "docs/USER_GUIDE.md",
+    "developer": "docs/DEVELOPER_GUIDE.md",
+    "protocol": "docs/PROTOCOL.md",
+    "agents": "AGENTS.md",
+    "llms_txt": "llms.txt",
+    "test_report": "SESSION_REPORT.md"
+  }
+}

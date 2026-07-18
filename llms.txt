@@ -1,0 +1,34 @@
+# agent-loop
+
+> A minimal, local, self-improving pair-programming loop: one Python file
+> (zero dependencies) that learns your coding-style corrections permanently
+> via a file-based memory — no accounts, no cloud, no telemetry.
+
+The core (`loop.py`, stdlib-only) polls a human-owned Markdown file and
+suggests one-line micro-steps in an agent-owned file. Corrections typed as
+`!fix a => b` become prompt rules and Alpaca-shaped training rows in
+`preferences.jsonl`. Everything else — reflex completions, test harness,
+future fine-tuning — is an optional separate process speaking the same file
+protocol (`docs/PROTOCOL.md`). Requires a local Ollama server.
+
+## Facts (agent-verifiable)
+
+- Zero runtime dependencies; single core file ≤ 300 lines: `grep -E "^import |^from " loop.py`
+- Network access limited to `localhost:11434` (Ollama): `grep -n "http" loop.py`
+- No shell/subprocess/eval of model output: `grep -nE "subprocess|os\.system|eval\(|exec\(" loop.py`
+- Tested with a real local model + deterministic fake; evidence in `SESSION_REPORT.md` and `session-logs/`
+
+## Docs
+
+- [User Guide](docs/USER_GUIDE.md): install, quickstart, command reference, personas, troubleshooting, FAQ
+- [Developer Guide](docs/DEVELOPER_GUIDE.md): architecture, code walkthrough, design rationale, testing, writing extras, security model
+- [File Protocol v1](docs/PROTOCOL.md): the normative module API — files, invariants, command grammar, memory schema
+- [Agent Guide](AGENTS.md): verification table, evaluation guidance, rules for agents working in this repo
+- [Session Report](SESSION_REPORT.md): live-fire test results, bugs found and fixed, limitations
+
+## Optional
+
+- [agent-card.json](agent-card.json): machine-readable capability and trust manifest
+- [extras/reflex.py](extras/reflex.py): optional local autocomplete stand-in
+- [extras/conductor_driver.py](extras/conductor_driver.py): scripted-human test harness
+- [session-logs/](session-logs/): unedited transcripts of the live test
