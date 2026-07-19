@@ -24,6 +24,8 @@ import subprocess
 import sys
 import time
 import urllib.request
+import signal
+import fcntl
 from datetime import datetime, timezone
 
 # ═══════════════════════════════════════════════════════════════
@@ -59,6 +61,11 @@ QUEST_TAIL_LINES     = 40
 MAX_FIX_RULES        = 5
 REQUEST_TIMEOUT      = 120
 WORKING_MEM_TAIL     = 10
+MAX_WORKING_MEM_LINES = 10000  # Memory leak prevention
+MAX_REPEAT_COUNT     = 3      # Infinite loop detection
+LOCK_RETRIES         = 5      # Race condition: file lock retries
+LOCK_WAIT            = 0.1    # Seconds between lock retries
+DRY_RUN              = False  # Global dry-run mode
 
 # Default config (overridden by config.yaml if present)
 DEFAULT_CONFIG = {
@@ -92,16 +99,16 @@ DEFAULT_CONFIG = {
             "pytest", "git", "python3",
         ],
         "allowed_patterns": [
-            r"^git (status|diff|log)",
-            r"^ls -?\w*\s",
+            r"^git (status|diff|log)(\s|$)",
+            r"^ls(\s+-\w*)?(\s|$)",
             r"^cat .+\.(md|py|txt|json|ya?ml|toml)$",
             r"^head -\d+ .+",
             r"^tail -\d+ .+",
-            r"^wc .+",
-            r"^grep -\w* .+",
-            r"^pytest (tests/|test_)?",
-            r"^python3 -m pytest",
-            r"^python3 -c .+",
+            r"^wc(\s|$)",
+            r"^grep(\s+-\w*)?\s.+",
+            r"^pytest(\s|$)",
+            r"^python3 -m pytest(\s|$)",
+            r"^python3 -c\s.+",
         ],
         "execution_timeout": 15,
     },
@@ -127,25 +134,76 @@ SYSTEM_PROMPT = (
 # ═══════════════════════════════════════════════════════════════
 
 def _get_json(url, timeout=5):
-    with urllib.request.urlopen(url, timeout=timeout) as r:
-        return json.loads(r.read().decode("utf-8"))
+    try:
+        with urllib.request.urlopen(url, timeout=timeout) as r:
+            return json.loads(r.read().decode("utf-8"))
+    except urllib.error.URLError as e:
+        raise IOError(f"Failed to fetch {url}: {e}") from e
+    except json.JSONDecodeError as e:
+        raise IOError(f"Invalid JSON response from {url}: {e}") from e
+    except Exception as e:
+        raise IOError(f"Unexpected error fetching {url}: {e}") from e
 
 def _post_json(url, payload, timeout):
-    body = json.dumps(payload).encode("utf-8")
-    req = urllib.request.Request(url, data=body,
-                                 headers={"Content-Type": "application/json"})
-    with urllib.request.urlopen(req, timeout=timeout) as r:
-        return json.loads(r.read().decode("utf-8"))
+    try:
+        body = json.dumps(payload).encode("utf-8")
+        req = urllib.request.Request(url, data=body,
+                                     headers={"Content-Type": "application/json"})
+        with urllib.request.urlopen(req, timeout=timeout) as r:
+            return json.loads(r.read().decode("utf-8"))
+    except urllib.error.URLError as e:
+        raise IOError(f"Failed to POST to {url}: {e}") from e
+    except json.JSONDecodeError as e:
+        raise IOError(f"Invalid JSON response from {url}: {e}") from e
+    except Exception as e:
+        raise IOError(f"Unexpected error posting to {url}: {e}") from e
 
 # ═══════════════════════════════════════════════════════════════
-# File helpers
+# File helpers (with locking for race condition prevention)
 # ═══════════════════════════════════════════════════════════════
+
+class FileLock:
+    """Context manager for file locking to prevent race conditions."""
+    def __init__(self, path, mode="r"):
+        self.path = path
+        self.mode = mode
+        self.fp = None
+        self.locked = False
+
+    def __enter__(self):
+        for attempt in range(LOCK_RETRIES):
+            try:
+                os.makedirs(os.path.dirname(self.path) or ".", exist_ok=True)
+                self.fp = open(self.path, self.mode, encoding="utf-8")
+                fcntl.flock(self.fp.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)
+                self.locked = True
+                return self.fp
+            except (IOError, OSError) as e:
+                if self.fp:
+                    self.fp.close()
+                if attempt < LOCK_RETRIES - 1:
+                    time.sleep(LOCK_WAIT * (2 ** attempt))  # Exponential backoff
+                else:
+                    raise IOError(f"Could not acquire lock on {self.path}: {e}") from e
+        return None
+
+    def __exit__(self, exc_type, exc_val, exc_tb):
+        if self.fp:
+            if self.locked:
+                try:
+                    fcntl.flock(self.fp.fileno(), fcntl.LOCK_UN)
+                except OSError:
+                    pass
+            self.fp.close()
 
 def read_text(path):
     try:
         with open(path, "r", encoding="utf-8") as f:
             return f.read()
     except FileNotFoundError:
+        return ""
+    except IOError as e:
+        print(f"! warning: could not read {path}: {e}")
         return ""
 
 def read_tail(path, n):
@@ -154,20 +212,43 @@ def read_tail(path, n):
 def mtime(path):
     try:
         return os.path.getmtime(path)
-    except OSError:
+    except (OSError, AttributeError) as e:
         return 0.0
 
 def append_text(path, text):
-    os.makedirs(os.path.dirname(path) or ".", exist_ok=True)
-    with open(path, "a", encoding="utf-8") as f:
-        f.write(text)
-        if not text.endswith("\n"):
-            f.write("\n")
+    if DRY_RUN:
+        print(f"[DRY-RUN] would append to {path}: {text[:100]}")
+        return
+    try:
+        os.makedirs(os.path.dirname(path) or ".", exist_ok=True)
+        with FileLock(path, "a") as f:
+            f.write(text)
+            if not text.endswith("\n"):
+                f.write("\n")
+    except IOError as e:
+        print(f"! error: could not append to {path}: {e}")
+        raise
 
 def write_text(path, text):
-    os.makedirs(os.path.dirname(path) or ".", exist_ok=True)
-    with open(path, "w", encoding="utf-8") as f:
-        f.write(text)
+    if DRY_RUN:
+        print(f"[DRY-RUN] would write to {path}: {text[:100]}")
+        return
+    try:
+        os.makedirs(os.path.dirname(path) or ".", exist_ok=True)
+        # Write to temp file first, then atomic rename
+        temp_path = f"{path}.tmp.{os.getpid()}"
+        with FileLock(temp_path, "w") as f:
+            f.write(text)
+        try:
+            os.replace(temp_path, path)  # Atomic on POSIX
+        except AttributeError:
+            # Fallback for Windows
+            if os.path.exists(path):
+                os.remove(path)
+            os.rename(temp_path, path)
+    except IOError as e:
+        print(f"! error: could not write to {path}: {e}")
+        raise
 
 # ═══════════════════════════════════════════════════════════════
 # Config loading (minimal YAML-ish parser, no dependency)
@@ -177,7 +258,11 @@ def load_config():
     """Load config.yaml with a minimal parser. Falls back to DEFAULT_CONFIG."""
     config = json.loads(json.dumps(DEFAULT_CONFIG))  # deep copy
 
-    text = read_text(CONFIG_FILE)
+    try:
+        text = read_text(CONFIG_FILE)
+    except IOError:
+        return config
+
     if not text:
         return config
 
@@ -215,7 +300,44 @@ def load_config():
                 except ValueError:
                     config[section][key] = val
 
-    return config
+    # Validate and sanitize config
+    return _validate_config(config)
+
+def _validate_config(config):
+    """Validate config values and fall back to defaults for invalid values."""
+    try:
+        # Validate tick section
+        if "tick" in config:
+            tick_cfg = config["tick"]
+            if not isinstance(tick_cfg.get("enabled"), (bool, type(None))):
+                tick_cfg["enabled"] = DEFAULT_CONFIG["tick"]["enabled"]
+            if not isinstance(tick_cfg.get("interval_seconds"), (int, float)) or tick_cfg.get("interval_seconds", 0) <= 0:
+                tick_cfg["interval_seconds"] = DEFAULT_CONFIG["tick"]["interval_seconds"]
+            if not isinstance(tick_cfg.get("idle_only"), (bool, type(None))):
+                tick_cfg["idle_only"] = DEFAULT_CONFIG["tick"]["idle_only"]
+
+        # Validate goals section
+        if "goals" in config:
+            goals_cfg = config["goals"]
+            if not isinstance(goals_cfg.get("max_concurrent"), int) or goals_cfg.get("max_concurrent", 0) < 1:
+                goals_cfg["max_concurrent"] = DEFAULT_CONFIG["goals"]["max_concurrent"]
+            if not isinstance(goals_cfg.get("auto_advance"), (bool, type(None))):
+                goals_cfg["auto_advance"] = DEFAULT_CONFIG["goals"]["auto_advance"]
+
+        # Validate tools section
+        if "tools" in config:
+            tools_cfg = config["tools"]
+            if not isinstance(tools_cfg.get("allowed_executables"), list):
+                tools_cfg["allowed_executables"] = DEFAULT_CONFIG["tools"]["allowed_executables"]
+            if not isinstance(tools_cfg.get("allowed_patterns"), list):
+                tools_cfg["allowed_patterns"] = DEFAULT_CONFIG["tools"]["allowed_patterns"]
+            if not isinstance(tools_cfg.get("execution_timeout"), (int, float)) or tools_cfg.get("execution_timeout", 0) <= 0:
+                tools_cfg["execution_timeout"] = DEFAULT_CONFIG["tools"]["execution_timeout"]
+
+        return config
+    except (KeyError, TypeError, AttributeError) as e:
+        print(f"! warning: invalid config.yaml, using defaults: {e}")
+        return DEFAULT_CONFIG
 
 # ═══════════════════════════════════════════════════════════════
 # File initialization
@@ -266,13 +388,65 @@ def ensure_files():
     os.makedirs("tools", exist_ok=True)
 
 def check_server():
+    """Verify the model server is reachable with proper error handling."""
     try:
         names = [m.get("name", "") for m in _get_json(SERVER_TAGS_URL).get("models", [])]
         family = MODEL_NAME.split(":")[0]
         if not any(n == MODEL_NAME or n.startswith(family) for n in names):
             print(f"! warning: '{MODEL_NAME}' not found. Run:  ollama pull {MODEL_NAME}")
-    except Exception:
-        sys.exit("Cannot reach model server on localhost:11434 — is Ollama running?")
+    except IOError as e:
+        sys.exit(f"Cannot reach model server on localhost:11434 — is Ollama running? {e}")
+    except Exception as e:
+        sys.exit(f"Unexpected error checking server: {e}")
+
+def startup_self_check():
+    """Verify all required files exist and are writable at startup."""
+    required_files = [
+        WORKSPACE_FILE, STREAM_FILE, QUEST_FILE, MEMORY_FILE,
+        GOALS_FILE, CONFIG_FILE, TICK_FILE, WORKING_MEM_FILE, APPROVAL_FILE
+    ]
+
+    issues = []
+    for f in required_files:
+        # Check if directory exists and is writable
+        dir_path = os.path.dirname(f) or "."
+        if not os.path.exists(dir_path):
+            try:
+                os.makedirs(dir_path, exist_ok=True)
+            except OSError as e:
+                issues.append(f"Cannot create directory {dir_path}: {e}")
+        elif not os.access(dir_path, os.W_OK):
+            issues.append(f"Directory {dir_path} is not writable")
+
+        # Try to create/append to the file
+        try:
+            if not os.path.exists(f):
+                # Create empty file
+                with open(f, "a", encoding="utf-8") as fp:
+                    pass
+            elif not os.access(f, os.W_OK):
+                issues.append(f"File {f} is not writable")
+        except OSError as e:
+            issues.append(f"Cannot access file {f}: {e}")
+
+    if issues:
+        sys.exit("Startup self-check failed:\n" + "\n".join(f"  - {i}" for i in issues))
+    print("* startup self-check passed")
+
+# Global shutdown flag for graceful signal handling
+_shutdown_requested = False
+
+def _signal_handler(signum, frame):
+    """Handle SIGTERM and SIGINT for graceful shutdown."""
+    global _shutdown_requested
+    _shutdown_requested = True
+    signal_name = signal.Signals(signum).name if hasattr(signal, "Signals") else str(signum)
+    print(f"\n* received {signal_name}, shutting down gracefully...")
+
+def setup_signal_handlers():
+    """Set up signal handlers for graceful shutdown."""
+    signal.signal(signal.SIGINT, _signal_handler)
+    signal.signal(signal.SIGTERM, _signal_handler)
 
 # ═══════════════════════════════════════════════════════════════
 # Memory (style corrections + working memory)
@@ -292,7 +466,10 @@ def log_fix(rejected, accepted):
     record = {"instruction": "Apply the user's style correction in future code.",
               "input": rejected, "output": accepted,
               "timestamp": datetime.now(timezone.utc).isoformat()}
-    append_text(MEMORY_FILE, json.dumps(record))
+    try:
+        append_text(MEMORY_FILE, json.dumps(record))
+    except IOError as e:
+        print(f"! warning: could not log fix: {e}")
 
 def load_working_memory(goal_id=None, limit=WORKING_MEM_TAIL):
     records = []
@@ -314,6 +491,17 @@ def append_working_memory(record_type, content, goal_id=None):
         "goal_id": goal_id,
         "content": content,
     }
+    # Memory leak prevention: rotate if file exceeds max lines
+    try:
+        lines = read_text(WORKING_MEM_FILE).splitlines()
+        if len(lines) >= MAX_WORKING_MEM_LINES:
+            # Keep last 80% of max lines
+            keep_from = int(MAX_WORKING_MEM_LINES * 0.2)
+            with FileLock(WORKING_MEM_FILE, "w") as f:
+                f.write("\n".join(lines[keep_from:]) + "\n")
+    except IOError:
+        pass  # Fall through to append
+
     append_text(WORKING_MEM_FILE, json.dumps(record))
 
 # ═══════════════════════════════════════════════════════════════
@@ -321,37 +509,75 @@ def append_working_memory(record_type, content, goal_id=None):
 # ═══════════════════════════════════════════════════════════════
 
 def parse_goals():
-    """Parse goals.md into a list of goal dicts."""
-    text = read_text(GOALS_FILE)
+    """Parse goals.md into a list of goal dicts. Handles malformed input and duplicate IDs."""
+    try:
+        text = read_text(GOALS_FILE)
+    except IOError:
+        return []
+
     goals = []
     current = None
+    seen_ids = set()
 
     for line in text.splitlines():
         stripped = line.strip()
         if stripped.startswith("## [") and "]" in stripped:
             if current:
-                goals.append(current)
-            gid = stripped[4:stripped.index("]")]
-            title = stripped[stripped.index("]")+1:].strip().lstrip("—").strip()
-            current = {"id": gid, "title": title, "context": "",
-                       "status": "pending", "priority": 99}
+                # Validate and clean goal before adding
+                current.pop("_section", None)
+                if current["id"] not in seen_ids:
+                    seen_ids.add(current["id"])
+                    goals.append(current)
+                else:
+                    print(f"! warning: duplicate goal ID {current['id']}, skipping")
+
+            # Parse goal header with better error handling
+            try:
+                bracket_end = stripped.index("]")
+                gid = stripped[4:bracket_end].strip()
+                title = stripped[bracket_end+1:].strip().lstrip("—").lstrip("-").strip()
+
+                # Validate ID format
+                if not gid or not gid.replace("_", "").replace("-", "").isalnum():
+                    gid = f"G{len(seen_ids)+1:03d}"  # Auto-generate if invalid
+
+                current = {
+                    "id": gid,
+                    "title": title if title else "(untitled)",
+                    "context": "",
+                    "status": "pending",
+                    "priority": 99
+                }
+            except (ValueError, IndexError):
+                current = None
+                continue
+
         elif current:
             if stripped.startswith("### context"):
                 current["_section"] = "context"
             elif stripped.startswith("### status:"):
-                current["status"] = stripped.split(":", 1)[1].strip()
+                status_val = stripped.split(":", 1)[1].strip().lower()
+                # Validate status value
+                if status_val in ("pending", "in_progress", "complete", "failed"):
+                    current["status"] = status_val
+                else:
+                    current["status"] = "pending"  # Default
                 current["_section"] = None
             elif stripped.startswith("### priority:"):
                 try:
-                    current["priority"] = int(stripped.split(":", 1)[1].strip())
-                except ValueError:
-                    pass
+                    prio_val = stripped.split(":", 1)[1].strip()
+                    current["priority"] = max(1, min(999, int(prio_val)))  # Clamp to 1-999
+                except (ValueError, IndexError):
+                    current["priority"] = 99  # Default
                 current["_section"] = None
             elif current.get("_section") == "context" and stripped:
                 current["context"] += stripped + " "
 
     if current:
-        goals.append(current)
+        current.pop("_section", None)
+        if current["id"] not in seen_ids:
+            goals.append(current)
+
     return goals
 
 def select_active_goal(goals, config):
@@ -364,15 +590,22 @@ def select_active_goal(goals, config):
     return candidates[0] if candidates else None
 
 def update_goal_status(goal_id, status, summary=None):
-    """Update goal status in goals.md."""
-    text = read_text(GOALS_FILE)
+    """Update goal status in goals.md with error handling and file locking."""
+    try:
+        text = read_text(GOALS_FILE)
+    except IOError as e:
+        print(f"! error: could not read goals file: {e}")
+        return
+
     lines = text.splitlines()
     new_lines = []
     current_goal = None
+    updated = False
 
     for line in lines:
         if line.strip().startswith("## [") and "]" in line:
-            gid = line.strip()[4:line.strip().index("]")]
+            stripped = line.strip()
+            gid = stripped[4:stripped.index("]")].strip()
             current_goal = gid
         elif current_goal == goal_id and line.strip().startswith("### status:"):
             line = f"### status: {status}"
@@ -381,10 +614,15 @@ def update_goal_status(goal_id, status, summary=None):
                 new_lines.append(line)
                 new_lines.append(f"### status")
                 new_lines.append(f"- {ts} — {summary}")
+                updated = True
                 continue
         new_lines.append(line)
 
-    write_text(GOALS_FILE, "\n".join(new_lines) + "\n")
+    if updated or any(status in line for line in new_lines if "### status:" in line):
+        try:
+            write_text(GOALS_FILE, "\n".join(new_lines) + "\n")
+        except IOError as e:
+            print(f"! error: could not write goal status: {e}")
 
 # ═══════════════════════════════════════════════════════════════
 # Tool sandbox
@@ -398,20 +636,45 @@ class ToolSandbox:
         self.allowed_patterns = []
         for p in raw_patterns:
             try:
+                # Compile with FULLMATCH semantics for security
+                # Ensure patterns are anchored to prevent bypass
+                if not p.startswith("^"):
+                    p = "^" + p
+                if not p.endswith("$"):
+                    p += "$"
                 self.allowed_patterns.append(re.compile(p))
-            except re.error:
-                pass
+            except re.error as e:
+                print(f"! warning: invalid regex pattern '{p}': {e}")
+
         self.execution_timeout = tools_cfg.get("execution_timeout", 15)
+
+    def _sanitize_command(self, command):
+        """Basic command sanitization to detect obvious bypass attempts."""
+        # Detect shell metacharacters that could enable command chaining
+        dangerous = ["&&", "||", ";", "|", "$(", "`", "$(", "\x00"]
+        for d in dangerous:
+            if d in command:
+                return False, f"potentially unsafe character: {repr(d)}"
+        return True, "ok"
 
     def check_allowed(self, command):
         parts = command.split()
         if not parts:
             return False, "empty command"
+
         executable = parts[0]
         if executable not in self.allowed_executables:
             return False, f"'{executable}' not in allowlist"
-        if not any(p.match(command) for p in self.allowed_patterns):
+
+        # Check for dangerous metacharacters
+        safe, reason = self._sanitize_command(command)
+        if not safe:
+            return False, reason
+
+        # Pattern matching with FULLMATCH semantics
+        if not any(p.fullmatch(command) for p in self.allowed_patterns):
             return False, "command matches no allowed pattern"
+
         return True, "ok"
 
     def execute(self, command):
@@ -419,13 +682,19 @@ class ToolSandbox:
         ts = datetime.now(timezone.utc).isoformat()
         req_id = f"REQ-{int(time.time())}"
 
-        # Audit log
+        # Audit log (with error handling)
         audit = {"id": req_id, "command": command, "timestamp": ts,
                  "allowed": allowed, "reason": reason}
-        append_text(AUDIT_FILE, json.dumps(audit))
+        try:
+            append_text(AUDIT_FILE, json.dumps(audit))
+        except IOError as e:
+            print(f"! warning: could not write audit log: {e}")
 
         if not allowed:
             return {"status": "rejected", "reason": reason}
+
+        if DRY_RUN:
+            return {"status": "dry_run", "reason": "dry-run mode enabled"}
 
         try:
             result = subprocess.run(
@@ -522,8 +791,27 @@ def _normalize(line):
     return line.strip().lower().lstrip("-*#> `").rstrip(".")
 
 def _already_done(suggestion):
-    done = {_normalize(l) for l in read_text(STREAM_FILE).splitlines()}
-    return _normalize(suggestion) in done
+    try:
+        done = {_normalize(l) for l in read_text(STREAM_FILE).splitlines()}
+        return _normalize(suggestion) in done
+    except IOError:
+        return False
+
+# Infinite loop detection state
+_repeat_tracker = collections.deque(maxlen=MAX_REPEAT_COUNT)
+
+def _is_repeating(action_text):
+    """Detect if the agent is stuck in a loop suggesting the same thing."""
+    normalized = _normalize(action_text)
+    if not normalized:
+        return False
+
+    _repeat_tracker.append(normalized)
+    # If we've seen this same normalized text MAX_REPEAT_COUNT times in a row
+    if len(_repeat_tracker) == MAX_REPEAT_COUNT and len(set(_repeat_tracker)) == 1:
+        _repeat_tracker.clear()  # Reset after detection
+        return True
+    return False
 
 def ask_model(messages, temp=0.4):
     payload = {
@@ -545,8 +833,16 @@ def parse_action(text):
         # Find first JSON object in the text
         match = re.search(r'\{[^{}]*\}', text)
         if match:
-            return json.loads(match.group())
-    except json.JSONDecodeError:
+            parsed = json.loads(match.group())
+            # Validate it has an action key, or treat as suggestion
+            if "action" in parsed:
+                return parsed
+            # Empty JSON {} or missing action → check for text field
+            if "text" in parsed:
+                return {"action": "suggest", "text": parsed["text"]}
+            # Empty JSON {} → wait
+            return {"action": "wait", "reason": "empty action"}
+    except (json.JSONDecodeError, AttributeError):
         pass
 
     # Fallback: treat as a suggestion
@@ -572,7 +868,13 @@ def execute_action(action, rules, notes, sandbox, config, active_goal):
             return ("→ empty suggestion", False)
         if _already_done(text):
             return (f"→ repeat detected: {text[:60]}", False)
-        append_text(STREAM_FILE, text)
+        # Infinite loop detection
+        if _is_repeating(text):
+            return (f"→ LOOP BREAK: same suggestion repeated {MAX_REPEAT_COUNT} times", False)
+        try:
+            append_text(STREAM_FILE, text)
+        except IOError as e:
+            return (f"→ write failed: {e}", False)
         return (f"→ {text}", True)
 
     if act == "tool":
@@ -640,9 +942,12 @@ def handle_command(cmd, rules, notes, paused):
     if cmd == "!step":
         return paused, True
     if cmd == "!clear":
-        write_text(STREAM_FILE,
-            "# stream.md — agent-owned. Suggestions appear here.\n")
-        print("— stream.md cleared")
+        try:
+            write_text(STREAM_FILE,
+                "# stream.md — agent-owned. Suggestions appear here.\n")
+            print("— stream.md cleared")
+        except IOError as e:
+            print(f"! error: could not clear stream.md: {e}")
         return paused, False
     if cmd.startswith("!note "):
         note = cmd[len("!note "):].strip()
@@ -672,30 +977,39 @@ def handle_command(cmd, rules, notes, paused):
         # Quick goal add: !goal Write tests for the reflex engine
         title = cmd[len("!goal "):].strip()
         if title:
-            existing = read_text(GOALS_FILE)
-            num = existing.count("## [G") + 1
-            gid = f"G{num:03d}"
-            block = (f"\n## [{gid}] {title}\n"
-                     f"### context\n"
-                     f"(add context here)\n"
-                     f"### status: pending\n"
-                     f"### priority: {num}\n")
-            append_text(GOALS_FILE, block)
-            print(f"— added goal {gid}: {title}")
+            try:
+                existing = read_text(GOALS_FILE)
+                num = existing.count("## [G") + 1
+                gid = f"G{num:03d}"
+                block = (f"\n## [{gid}] {title}\n"
+                         f"### context\n"
+                         f"(add context here)\n"
+                         f"### status: pending\n"
+                         f"### priority: {num}\n")
+                append_text(GOALS_FILE, block)
+                print(f"— added goal {gid}: {title}")
+            except IOError as e:
+                print(f"! error: could not add goal: {e}")
         return paused, False
     if cmd == "!goals":
-        goals = parse_goals()
-        for g in goals:
-            status_icon = {"pending": "○", "in_progress": "◐",
-                          "complete": "●", "failed": "✗"}.get(g["status"], "?")
-            print(f"  {status_icon} [{g['id']}] P{g['priority']} {g['title'][:50]}")
+        try:
+            goals = parse_goals()
+            for g in goals:
+                status_icon = {"pending": "○", "in_progress": "◐",
+                              "complete": "●", "failed": "✗"}.get(g["status"], "?")
+                print(f"  {status_icon} [{g['id']}] P{g['priority']} {g['title'][:50]}")
+        except IOError as e:
+            print(f"! error: could not parse goals: {e}")
         return paused, False
     if cmd == "!status":
-        print(f"— tick: {'enabled' if True else 'disabled'}")
-        goals = parse_goals()
-        active = sum(1 for g in goals if g["status"] in ("pending", "in_progress"))
-        done = sum(1 for g in goals if g["status"] == "complete")
-        print(f"— goals: {active} active, {done} complete")
+        try:
+            print(f"— tick: {'enabled' if True else 'disabled'}")
+            goals = parse_goals()
+            active = sum(1 for g in goals if g["status"] in ("pending", "in_progress"))
+            done = sum(1 for g in goals if g["status"] == "complete")
+            print(f"— goals: {active} active, {done} complete")
+        except IOError as e:
+            print(f"! error: could not get status: {e}")
         return paused, False
     print(f"! unknown: {cmd}  (known: !fix !note !step !pause !resume !clear !goal !goals !status !approve !reject)")
     return paused, False
@@ -705,31 +1019,47 @@ def handle_command(cmd, rules, notes, paused):
 # ═══════════════════════════════════════════════════════════════
 
 def update_tick_status(active_goal, trigger, last_action):
-    ts = datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
-    next_ts = datetime.now(timezone.utc).timestamp() + AUTONOMOUS_INTERVAL
-    next_str = datetime.fromtimestamp(next_ts, tz=timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
+    try:
+        ts = datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
+        next_ts = datetime.now(timezone.utc).timestamp() + AUTONOMOUS_INTERVAL
+        next_str = datetime.fromtimestamp(next_ts, tz=timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
 
-    goal_text = "none"
-    if active_goal:
-        goal_text = f"[{active_goal['id']}] {active_goal['title'][:50]}"
+        goal_text = "none"
+        if active_goal:
+            goal_text = f"[{active_goal['id']}] {active_goal['title'][:50]}"
 
-    content = (
-        f"# tick.md — autonomous agent status\n\n"
-        f"**Last tick:** {ts}\n"
-        f"**Next tick:** {next_str}\n"
-        f"**Trigger:** {trigger}\n"
-        f"**Active goal:** {goal_text}\n"
-        f"**Last action:** {last_action[:80]}\n\n"
-        f"---\n"
-        f"*This file is owned by the autonomous agent. Read-only for humans.*\n"
-    )
-    write_text(TICK_FILE, content)
+        content = (
+            f"# tick.md — autonomous agent status\n\n"
+            f"**Last tick:** {ts}\n"
+            f"**Next tick:** {next_str}\n"
+            f"**Trigger:** {trigger}\n"
+            f"**Active goal:** {goal_text}\n"
+            f"**Last action:** {last_action[:80]}\n\n"
+            f"---\n"
+            f"*This file is owned by the autonomous agent. Read-only for humans.*\n"
+        )
+        write_text(TICK_FILE, content)
+    except IOError as e:
+        print(f"! warning: could not update tick status: {e}")
 
 # ═══════════════════════════════════════════════════════════════
 # Main loop
 # ═══════════════════════════════════════════════════════════════
 
 def main():
+    global DRY_RUN, _shutdown_requested
+
+    # Parse command-line arguments for --dry-run
+    if "--dry-run" in sys.argv or "-d" in sys.argv:
+        DRY_RUN = True
+        print("* DRY-RUN MODE: no file writes or tool execution")
+
+    # Set up signal handlers for graceful shutdown
+    setup_signal_handlers()
+
+    # Startup self-check
+    startup_self_check()
+
     ensure_files()
     check_server()
 
@@ -751,39 +1081,52 @@ def main():
 
     print(f"* autonomous loop up — model: {MODEL_NAME}")
     print(f"* tick: {'enabled' if tick_enabled else 'disabled'}, interval: {tick_interval}s")
+    if DRY_RUN:
+        print(f"* DRY-RUN MODE: showing what would happen without executing")
     print(f"* commands: !fix !note !step !pause !resume !clear !goal !goals !status !approve !reject")
     print(f"* goals file: {GOALS_FILE}")
 
-    while True:
-        time.sleep(TICK_SECONDS)
+    while not _shutdown_requested:
+        try:
+            time.sleep(TICK_SECONDS)
+        except IOError:
+            # Handle sleep interruption during shutdown
+            break
 
         # ── Human-move detection (existing protocol) ────────────
-        current_mtime = mtime(WORKSPACE_FILE)
-        if current_mtime != last_workspace_mtime:
-            last_workspace_mtime = current_mtime
-            workspace = read_text(WORKSPACE_FILE)
-            if workspace != workspace_seen:
-                workspace_seen = workspace
-                last_edit = time.time()
-                dirty = True
-                for line in workspace.splitlines():
-                    cmd = line.strip()
-                    if cmd.startswith("!") and cmd not in seen_commands:
-                        seen_commands.add(cmd)
-                        paused, force_step = handle_command(cmd, rules, notes, paused)
+        try:
+            current_mtime = mtime(WORKSPACE_FILE)
+            if current_mtime != last_workspace_mtime:
+                last_workspace_mtime = current_mtime
+                workspace = read_text(WORKSPACE_FILE)
+                if workspace != workspace_seen:
+                    workspace_seen = workspace
+                    last_edit = time.time()
+                    dirty = True
+                    for line in workspace.splitlines():
+                        cmd = line.strip()
+                        if cmd.startswith("!") and cmd not in seen_commands:
+                            seen_commands.add(cmd)
+                            paused, force_step = handle_command(cmd, rules, notes, paused)
+        except IOError as e:
+            print(f"! warning: workspace file access error: {e}")
 
         if force_step:
             dirty, last_edit, force_step = True, 0.0, False
 
         # ── Human-triggered turn ────────────────────────────────
         if dirty and not paused and time.time() - last_edit >= IDLE_DEBOUNCE:
-            messages = build_human_move_prompt(rules, notes)
-            text = ask_model(messages, temp=0.3)
-            action = parse_action(text)
-            log_line, _ = execute_action(action, rules, notes, sandbox, config, None)
-            print(f"[human] {log_line}")
-            last_action = log_line
-            dirty = False
+            try:
+                messages = build_human_move_prompt(rules, notes)
+                text = ask_model(messages, temp=0.3)
+                action = parse_action(text)
+                log_line, _ = execute_action(action, rules, notes, sandbox, config, None)
+                print(f"[human] {log_line}")
+                last_action = log_line
+            except IOError as e:
+                print(f"! error during human turn: {e}")
+            finally:
+                dirty = False
             continue
 
         # ── Autonomous tick ─────────────────────────────────────
@@ -794,45 +1137,60 @@ def main():
 
             last_tick_time = now
 
-            goals = parse_goals()
-            active_goal = select_active_goal(goals, config)
+            try:
+                goals = parse_goals()
+                active_goal = select_active_goal(goals, config)
 
-            update_tick_status(active_goal, "autonomous", last_action)
+                update_tick_status(active_goal, "autonomous", last_action)
 
-            if not active_goal:
-                # All goals complete — gentle idle
-                append_working_memory("context",
-                    "All goals complete. Agent idling. Awaiting new goals.")
-                print(f"[tick] all goals complete — idling")
-                last_action = "idle — all goals complete"
-                continue
+                if not active_goal:
+                    # All goals complete — gentle idle
+                    append_working_memory("context",
+                        "All goals complete. Agent idling. Awaiting new goals.")
+                    print(f"[tick] all goals complete — idling")
+                    last_action = "idle — all goals complete"
+                    continue
 
-            # Mark goal as in_progress if pending
-            if active_goal["status"] == "pending":
-                update_goal_status(active_goal["id"], "in_progress")
-                active_goal["status"] = "in_progress"
-                print(f"[tick] starting goal [{active_goal['id']}] {active_goal['title'][:50]}")
+                # Mark goal as in_progress if pending
+                if active_goal["status"] == "pending":
+                    update_goal_status(active_goal["id"], "in_progress")
+                    active_goal["status"] = "in_progress"
+                    print(f"[tick] starting goal [{active_goal['id']}] {active_goal['title'][:50]}")
 
-            # Ask the model for the next action
-            messages = build_autonomous_prompt(rules, active_goal, config, notes)
-            text = ask_model(messages, temp=0.5)
+                # Ask the model for the next action
+                messages = build_autonomous_prompt(rules, active_goal, config, notes)
+                text = ask_model(messages, temp=0.5)
 
-            if not text.strip():
-                print(f"[tick] model returned empty — retrying next tick")
-                last_action = "empty model response"
-                continue
+                if not text.strip():
+                    print(f"[tick] model returned empty — retrying next tick")
+                    last_action = "empty model response"
+                    continue
 
-            action = parse_action(text)
-            log_line, did_something = execute_action(
-                action, rules, notes, sandbox, config, active_goal)
+                action = parse_action(text)
+                log_line, did_something = execute_action(
+                    action, rules, notes, sandbox, config, active_goal)
 
-            print(f"[tick] {log_line}")
-            last_action = log_line
+                print(f"[tick] {log_line}")
+                last_action = log_line
 
-            update_tick_status(active_goal, "autonomous", last_action)
+                update_tick_status(active_goal, "autonomous", last_action)
+            except IOError as e:
+                print(f"! error during autonomous tick: {e}")
+            except Exception as e:
+                print(f"! unexpected error during tick: {e}")
+                last_action = f"error: {e}"
 
 if __name__ == "__main__":
     try:
         main()
     except KeyboardInterrupt:
         print("\n* autonomous loop stopped cleanly")
+    except SystemExit:
+        # Re-raise SystemExit (from sys.exit in startup checks)
+        raise
+    except Exception as e:
+        print(f"\n! fatal error: {e}")
+        sys.exit(1)
+    finally:
+        if _shutdown_requested:
+            print("* graceful shutdown complete")

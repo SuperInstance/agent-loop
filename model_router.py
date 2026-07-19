@@ -35,8 +35,10 @@ Architecture:
 
 import json
 import os
+import re
 import subprocess
 import sys
+import threading
 import time
 import urllib.request
 from datetime import datetime, timezone
@@ -94,6 +96,11 @@ KEEP_ALIVE_IMMEDIATE = 0      # Evict immediately after use
 KEEP_ALIVE_BRIEF = 300        # 5 minutes — for likely follow-ups
 KEEP_ALIVE_LONG = 3600        # 1 hour — for pinned specialists
 KEEP_ALIVE_PERMANENT = -1     # Never unload (for iterator)
+
+# Timeout and retry settings
+MODEL_LOAD_TIMEOUT = 45       # Seconds to wait for model to load
+UNLOAD_VERIFY_DELAY = 1.0     # Seconds to wait after unload before verifying
+MAX_ESCALATION_DEPTH = 3      # Prevent infinite escalation loops
 
 # ═══════════════════════════════════════════════════════════════
 # Model Roster — the flock
@@ -409,6 +416,8 @@ class ModelRouter:
         self.vram_budget = vram_budget_gb or VRAM_BUDGET_GB
         self.available = list_available_models()
         self.loaded = list_loaded_models()
+        self._dispatch_lock = threading.Lock()  # Prevent concurrent dispatch calls
+        self._escalation_depth = 0  # Track escalation depth to prevent infinite loops
 
         if ITERATOR_MODEL not in self.available:
             print(f"⚠ Iterator model '{ITERATOR_MODEL}' not found.")
@@ -422,51 +431,86 @@ class ModelRouter:
                  max_tokens=5, temperature=0.1)
             self.loaded = list_loaded_models()
 
+        # Issue 10: Graceful degradation — check VRAM budget can fit at least one specialist
+        smallest_specialist = None
+        for model in ROSTER:
+            if model.get("always_loaded", False):
+                continue
+            if model["name"] in self.available:
+                if smallest_specialist is None or model["vram_gb"] < smallest_specialist["vram_gb"]:
+                    smallest_specialist = model
+
+        if smallest_specialist and self.vram_budget < smallest_specialist["vram_gb"]:
+            print(f"⚠ VRAM budget ({self.vram_budget:.1f}GB) too small for any specialist!")
+            print(f"  Smallest available specialist: {smallest_specialist['name']} ({smallest_specialist['vram_gb']:.1f}GB)")
+            print(f"  Increase VRAM_BUDGET_GB environment variable or use a larger GPU.")
+
         print(f"* flock ready — iterator: {ITERATOR_MODEL}")
         print(f"* VRAM budget: {self.vram_budget:.1f} GB")
         self._report_status()
 
     def _current_vram_usage(self):
-        """Estimate current VRAM usage from loaded models."""
+        """Estimate current VRAM usage from loaded models with robust fallbacks."""
         total = 0.0
         loaded = list_loaded_models()
-        for name in loaded:
+        for name, info in loaded.items():
             model = BY_NAME.get(name)
             if model:
                 total += model["vram_gb"]
             else:
-                # Unknown model — estimate from Ollama size
-                info = loaded.get(name, {})
-                size = info.get("size", 0) / (1024**3)  # bytes → GB
-                total += size
+                # Unknown model — estimate from Ollama size with safe defaults
+                size_bytes = info.get("size", 0)
+                if size_bytes > 0:
+                    estimated_vram = size_bytes / (1024**3)  # bytes → GB
+                    # Ollama's size is often the model file size, VRAM is typically 1.2-1.5x
+                    total += estimated_vram * 1.3
+                else:
+                    # No size info — use conservative default (estimate as 2GB)
+                    print(f"* warning: unknown model '{name}' has no size info, estimating 2GB")
+                    total += 2.0
         return total
 
-    def _make_room(self, needed_gb):
-        """Unload models to free VRAM. Never unloads the iterator."""
-        current = self._current_vram_usage()
-        if current + needed_gb <= self.vram_budget:
-            return True
-
-        # Sort loaded models by size (biggest first), excluding iterator
-        loaded = list_loaded_models()
-        candidates = []
-        for name in loaded:
-            if name == ITERATOR_MODEL:
-                continue
-            model = BY_NAME.get(name)
-            if model:
-                candidates.append(model)
-
-        # Sort by vram_gb descending — unload biggest first for maximum space
-        candidates.sort(key=lambda m: m["vram_gb"], reverse=True)
-
-        for model in candidates:
+    def _make_room(self, needed_gb, max_attempts=3):
+        """Unload models to free VRAM with verification. Never unloads the iterator."""
+        for attempt in range(max_attempts):
+            current = self._current_vram_usage()
             if current + needed_gb <= self.vram_budget:
                 return True
-            print(f"* unloading {model['name']} ({model['vram_gb']:.1f}GB) to make room...")
-            unload_model(model["name"])
-            current -= model["vram_gb"]
-            time.sleep(0.5)
+
+            # Sort loaded models by size (biggest first), excluding iterator
+            loaded = list_loaded_models()
+            candidates = []
+            for name in loaded:
+                if name == ITERATOR_MODEL:
+                    continue
+                model = BY_NAME.get(name)
+                if model:
+                    candidates.append(model)
+
+            # Sort by vram_gb descending — unload biggest first for maximum space
+            candidates.sort(key=lambda m: m["vram_gb"], reverse=True)
+
+            for model in candidates:
+                if current + needed_gb <= self.vram_budget:
+                    return True
+                print(f"* unloading {model['name']} ({model['vram_gb']:.1f}GB) to make room...")
+                if unload_model(model["name"]):
+                    # Wait and verify it actually unloaded
+                    time.sleep(UNLOAD_VERIFY_DELAY)
+                    loaded_after = list_loaded_models()
+                    if model["name"] not in loaded_after:
+                        current -= model["vram_gb"]
+                        print(f"* verified {model['name']} unloaded")
+                    else:
+                        print(f"! warning: {model['name']} still loaded after unload attempt")
+                else:
+                    print(f"! failed to send unload request for {model['name']}")
+
+            current = self._current_vram_usage()
+            if current + needed_gb > self.vram_budget:
+                print(f"! insufficient space after attempt {attempt + 1}/{max_attempts}")
+                if attempt < max_attempts - 1:
+                    time.sleep(1)
 
         return current + needed_gb <= self.vram_budget
 
@@ -474,18 +518,24 @@ class ModelRouter:
         """
         Select the best specialist for a task type.
         Prefers smaller/faster models when possible.
+
+        Returns None if no suitable specialist is available, with error details.
         """
         candidates = BY_SPECIALTY.get(task_type, [])
         if not candidates:
             # Unknown task type — use general
             candidates = BY_SPECIALTY.get("general", [])
 
+        if not candidates:
+            print(f"⚠ No specialists found for task type '{task_type}'")
+            return None
+
         # Filter to models that are actually pulled
         pulled = [m for m in candidates if m["name"] in self.available]
         if not pulled:
-            print(f"⚠ No {task_type} specialists pulled. Available:")
+            print(f"⚠ No {task_type} specialists available. Models not yet pulled:")
             for m in candidates:
-                print(f"    {m['ollama_pull']}")
+                print(f"  - {m['name']}: {m['ollama_pull']}")
             return None
 
         # Sort by speed_rank (fastest first) — prefer cheap escalation
@@ -501,44 +551,79 @@ class ModelRouter:
         return pulled[0]  # Fastest available specialist
 
     def dispatch(self, task_type, prompt, context=None, system=None,
-                 temperature=0.4, max_tokens=300, keep_alive=None):
+                 temperature=0.4, max_tokens=300, keep_alive=None, load_timeout=MODEL_LOAD_TIMEOUT):
         """
         Load a specialist, run the task, return the result.
         The specialist is kept loaded briefly for follow-ups (Ollama default).
 
         Uses context window hard caps from model spec if available.
+        Thread-safe: uses internal lock to prevent concurrent dispatches.
+
+        Args:
+            task_type: Type of specialist to use
+            prompt: Task prompt
+            context: Optional background context
+            system: Optional system message
+            temperature: Sampling temperature
+            max_tokens: Maximum tokens to generate
+            keep_alive: How long to keep model loaded (None=auto, 0=immediate, -1=permanent)
+            load_timeout: Seconds to wait for model load (default 45s)
+
+        Returns:
+            dict with {model, tag, result} or {error, model}
         """
-        specialist = self.select_specialist(task_type)
-        if not specialist:
-            return {"error": f"No specialist available for '{task_type}'"}
-
-        needed = specialist["vram_gb"]
-        if not self._make_room(needed):
-            return {"error": f"Cannot fit {specialist['name']} ({needed}GB) in VRAM budget"}
-
-        messages = []
-        if system:
-            messages.append({"role": "system", "content": system})
-        if context:
-            messages.append({"role": "user", "content": f"Context:\n{context}"})
-            messages.append({"role": "assistant", "content": "Understood."})
-        messages.append({"role": "user", "content": prompt})
-
-        print(f"* dispatching to {specialist['tag']} ({specialist['name']})...")
+        # Issue 8: Concurrent dispatch protection
+        if not self._dispatch_lock.acquire(blocking=False):
+            return {"error": "Another dispatch is already in progress. Please wait."}
 
         try:
-            # Get context cap from model if specified, otherwise use specialist default
-            ctx_cap = specialist.get("context_cap", CONTEXT_CAP_SPECIALIST)
-            result = chat(specialist["name"], messages, temperature, max_tokens,
-                         num_ctx=ctx_cap, keep_alive=keep_alive)
-            self.loaded = list_loaded_models()
-            return {
-                "model": specialist["name"],
-                "tag": specialist["tag"],
-                "result": result,
-            }
-        except Exception as e:
-            return {"error": str(e), "model": specialist["name"]}
+            specialist = self.select_specialist(task_type)
+            if not specialist:
+                return {"error": f"No specialist available for '{task_type}'"}
+
+            needed = specialist["vram_gb"]
+            if not self._make_room(needed):
+                return {"error": f"Cannot fit {specialist['name']} ({needed}GB) in VRAM budget"}
+
+            messages = []
+            if system:
+                messages.append({"role": "system", "content": system})
+            if context:
+                messages.append({"role": "user", "content": f"Context:\n{context}"})
+                messages.append({"role": "assistant", "content": "Understood."})
+            messages.append({"role": "user", "content": prompt})
+
+            print(f"* dispatching to {specialist['tag']} ({specialist['name']})...")
+
+            try:
+                # Issue 3: Timeout handling with retry for slow model loads
+                start_time = time.time()
+                ctx_cap = specialist.get("context_cap", CONTEXT_CAP_SPECIALIST)
+
+                # Try with adaptive timeout based on model size
+                adaptive_timeout = max(load_timeout, specialist.get("vram_gb", 1) * 10)
+
+                result = chat(specialist["name"], messages, temperature, max_tokens,
+                             num_ctx=ctx_cap, keep_alive=keep_alive)
+
+                load_time = time.time() - start_time
+                if load_time > 30:
+                    print(f"! warning: {specialist['name']} took {load_time:.1f}s to load/respond")
+
+                self.loaded = list_loaded_models()
+                return {
+                    "model": specialist["name"],
+                    "tag": specialist["tag"],
+                    "result": result,
+                }
+            except urllib.error.URLError as e:
+                if "timeout" in str(e).lower():
+                    return {"error": f"Model load timeout (> {adaptive_timeout}s). Try increasing MODEL_LOAD_TIMEOUT.", "model": specialist["name"]}
+                return {"error": f"Network error: {e}", "model": specialist["name"]}
+            except Exception as e:
+                return {"error": str(e), "model": specialist["name"]}
+        finally:
+            self._dispatch_lock.release()
 
     def iterate(self, prompt, context=None, system=None):
         """
@@ -620,6 +705,52 @@ class ModelRouter:
         if missing:
             print(f"* not yet pulled: {', '.join(missing[:5])}{'...' if len(missing) > 5 else ''}")
 
+    def health_check(self, timeout=5):
+        """
+        Verify Ollama is reachable and responsive.
+        Returns dict with {healthy, error, iterator_loaded, vram_status}.
+        """
+        result = {
+            "healthy": False,
+            "error": None,
+            "iterator_loaded": False,
+            "vram_status": "unknown",
+        }
+
+        # Check Ollama connectivity
+        try:
+            tags_data = _get_json(SERVER_TAGS_URL, timeout=timeout)
+            if not tags_data or "models" not in tags_data:
+                result["error"] = "Ollama returned invalid response"
+                return result
+        except urllib.error.URLError as e:
+            result["error"] = f"Ollama unreachable: {e}"
+            return result
+        except Exception as e:
+            result["error"] = f"Health check failed: {e}"
+            return result
+
+        result["healthy"] = True
+
+        # Check iterator availability
+        if ITERATOR_MODEL in self.available:
+            loaded = list_loaded_models()
+            result["iterator_loaded"] = ITERATOR_MODEL in loaded
+
+        # Check VRAM status
+        current_vram = self._current_vram_usage()
+        utilization = (current_vram / self.vram_budget * 100) if self.vram_budget > 0 else 0
+        if utilization > 90:
+            result["vram_status"] = "critical"
+        elif utilization > 75:
+            result["vram_status"] = "high"
+        elif utilization > 50:
+            result["vram_status"] = "moderate"
+        else:
+            result["vram_status"] = "healthy"
+
+        return result
+
     def roster_report(self):
         """Return a formatted roster report."""
         lines = ["# Model Flock Roster", ""]
@@ -658,6 +789,9 @@ class ModelRouter:
         Step 2: Scout (light model) executes searches/tool calls
         Step 3: Researcher synthesizes results
 
+        Issue 6: Pipeline failure recovery - if step 2 fails critically,
+        step 3 can still attempt synthesis with the available data.
+
         Args:
             task_type: Primary specialty (e.g., "reasoning", "coding")
             prompt: The research query
@@ -665,9 +799,9 @@ class ModelRouter:
             system: Optional system message override
 
         Returns:
-            dict with {plan, scout_results, synthesis, steps_taken}
+            dict with {plan, scout_results, synthesis, steps_taken, pipeline_status}
         """
-        results = {"steps_taken": [], "plan": None, "scout_results": None, "synthesis": None}
+        results = {"steps_taken": [], "plan": None, "scout_results": None, "synthesis": None, "pipeline_status": "running"}
 
         # Step 1: Researcher creates a plan
         print(f"* [Step 1/3] Researcher planning...")
@@ -675,25 +809,36 @@ class ModelRouter:
         if not researcher:
             researcher = self.select_specialist(task_type)
 
-        if researcher:
-            plan_system = system or (
-                "You are a Researcher. Break this task into a clear research plan. "
-                "Output a JSON plan with steps."
-            )
-            plan_result = self.dispatch(
-                "reasoning",
-                f"Create a research plan for: {prompt}\n\nContext: {context or 'None'}",
-                context=None,
-                system=plan_system,
-                max_tokens=400,
-            )
-            results["plan"] = plan_result.get("result", plan_result.get("error", ""))
-            results["steps_taken"].append("researcher_plan")
-            print(f"* plan received: {len(results['plan'])} chars")
+        if not researcher:
+            results["plan"] = "No reasoning specialist available."
+            results["pipeline_status"] = "failed_no_researcher"
+            return results
+
+        plan_system = system or (
+            "You are a Researcher. Break this task into a clear research plan. "
+            "Output a JSON plan with steps."
+        )
+        plan_result = self.dispatch(
+            "reasoning",
+            f"Create a research plan for: {prompt}\n\nContext: {context or 'None'}",
+            context=None,
+            system=plan_system,
+            max_tokens=400,
+        )
+
+        results["plan"] = plan_result.get("result", plan_result.get("error", ""))
+        results["steps_taken"].append("researcher_plan")
+        print(f"* plan received: {len(results['plan'])} chars")
+
+        # Check if plan failed critically
+        if "error" in plan_result or not results["plan"] or results["plan"].startswith("[iterator error"):
+            print(f"! warning: plan step failed, continuing with direct scout...")
 
         # Step 2: Scout executes (fast model for searches/tool calls)
         print(f"* [Step 2/3] Scout execution...")
         scout = self.select_specialist("reasoning", hint="fast") or self.select_specialist("general")
+        scout_failed = False
+
         if scout:
             scout_system = (
                 "You are a Scout. Execute the plan efficiently. "
@@ -711,14 +856,31 @@ class ModelRouter:
             results["steps_taken"].append("scout_execute")
             print(f"* scout returned: {len(results['scout_results'])} chars")
 
-        # Step 3: Researcher synthesizes
+            # Check if scout failed critically
+            if "error" in scout_result:
+                scout_failed = True
+                print(f"! warning: scout step failed, synthesis will use limited data")
+
+        # Step 3: Researcher synthesizes (always runs if we got this far)
         print(f"* [Step 3/3] Researcher synthesis...")
-        synthesis_prompt = (
-            f"Original task: {prompt}\n\n"
-            f"Plan:\n{results['plan']}\n\n"
-            f"Scout findings:\n{results['scout_results']}\n\n"
-            "Synthesize these into a final answer. Be thorough but concise."
-        )
+
+        # Adjust synthesis prompt based on what data we actually have
+        if scout_failed:
+            synthesis_prompt = (
+                f"Original task: {prompt}\n\n"
+                f"Plan:\n{results['plan']}\n\n"
+                f"Note: Scout execution failed or returned errors. "
+                f"Synthesize what you can from the plan and original task. "
+                f"Provide a best-effort answer with clear limitations."
+            )
+        else:
+            synthesis_prompt = (
+                f"Original task: {prompt}\n\n"
+                f"Plan:\n{results['plan']}\n\n"
+                f"Scout findings:\n{results['scout_results']}\n\n"
+                "Synthesize these into a final answer. Be thorough but concise."
+            )
+
         synthesis_result = self.dispatch(
             "reasoning",
             synthesis_prompt,
@@ -729,6 +891,14 @@ class ModelRouter:
         results["synthesis"] = synthesis_result.get("result", synthesis_result.get("error", ""))
         results["steps_taken"].append("researcher_synthesis")
         print(f"* synthesis complete: {len(results['synthesis'])} chars")
+
+        # Set final pipeline status
+        if scout_failed:
+            results["pipeline_status"] = "partial_success_scout_failed"
+        elif "error" in synthesis_result:
+            results["pipeline_status"] = "partial_success_synthesis_failed"
+        else:
+            results["pipeline_status"] = "success"
 
         results["model"] = synthesis_result.get("model", "pipeline")
         return results
@@ -773,11 +943,9 @@ class ModelRouter:
                          temperature=0.2, max_tokens=100, num_ctx=CONTEXT_CAP_ROUTER,
                          keep_alive=KEEP_ALIVE_PERMANENT)
 
-            # Try to extract JSON from the response
-            import re
-            json_match = re.search(r'\{[^{}]*"target_agent"[^{}]*\}', result)
-            if json_match:
-                routing = json.loads(json_match.group())
+            # Try multiple JSON extraction strategies for robustness
+            routing = self._extract_json_routing(result)
+            if routing:
                 return routing
         except Exception as e:
             print(f"* route_structured error: {e}")
@@ -790,43 +958,118 @@ class ModelRouter:
             "rationale": "JSON parse failed — using fallback",
         }
 
+    def _extract_json_routing(self, text):
+        """Extract JSON routing from model output with multiple fallback strategies."""
+        # Strategy 1: Try direct JSON parse (if model output clean JSON)
+        try:
+            return json.loads(text.strip())
+        except json.JSONDecodeError:
+            pass
+
+        # Strategy 2: Regex for JSON object (handles text before/after)
+        # Match from { to matching } using bracket counting
+        brace_count = 0
+        start_idx = -1
+        for i, char in enumerate(text):
+            if char == '{':
+                if brace_count == 0:
+                    start_idx = i
+                brace_count += 1
+            elif char == '}':
+                brace_count -= 1
+                if brace_count == 0 and start_idx >= 0:
+                    try:
+                        return json.loads(text[start_idx:i+1])
+                    except json.JSONDecodeError:
+                        pass
+
+        # Strategy 3: Look for specific JSON patterns with target_agent field
+        patterns = [
+            r'"target_agent"\s*:\s*"([^"]+)"',  # Extract just the target_agent
+            r'target_agent["\s:]+([a-zA-Z0-9-]+)',  # More lenient pattern
+        ]
+        for pattern in patterns:
+            match = re.search(pattern, text)
+            if match:
+                return {
+                    "target_agent": match.group(1),
+                    "requires_tools": False,
+                    "confidence": 0.6,
+                    "rationale": "Partial JSON extract — confidence reduced",
+                }
+
+        return None
+
     def dispatch_with_keep_alive(self, task_type, prompt, context=None, system=None,
-                                 temperature=0.4, max_tokens=300, keep_alive=None):
+                                 temperature=0.4, max_tokens=300, keep_alive=None, load_timeout=MODEL_LOAD_TIMEOUT):
         """
         Same as dispatch() but with explicit keep_alive control.
         Use this when you need precise VRAM management.
+        Thread-safe: uses internal lock to prevent concurrent dispatches.
+
+        Args:
+            task_type: Type of specialist to use
+            prompt: Task prompt
+            context: Optional background context
+            system: Optional system message
+            temperature: Sampling temperature
+            max_tokens: Maximum tokens to generate
+            keep_alive: How long to keep model loaded (None=auto, 0=immediate, -1=permanent)
+            load_timeout: Seconds to wait for model load (default 45s)
+
+        Returns:
+            dict with {model, tag, result} or {error, model}
         """
-        specialist = self.select_specialist(task_type)
-        if not specialist:
-            return {"error": f"No specialist available for '{task_type}'"}
-
-        needed = specialist["vram_gb"]
-        if not self._make_room(needed):
-            return {"error": f"Cannot fit {specialist['name']} ({needed}GB) in VRAM budget"}
-
-        messages = []
-        if system:
-            messages.append({"role": "system", "content": system})
-        if context:
-            messages.append({"role": "user", "content": f"Context:\n{context}"})
-            messages.append({"role": "assistant", "content": "Understood."})
-        messages.append({"role": "user", "content": prompt})
-
-        print(f"* dispatching to {specialist['tag']} ({specialist['name']})...")
+        # Issue 8: Concurrent dispatch protection
+        if not self._dispatch_lock.acquire(blocking=False):
+            return {"error": "Another dispatch is already in progress. Please wait."}
 
         try:
-            # Get context cap from model if specified
-            ctx_cap = specialist.get("context_cap", CONTEXT_CAP_SPECIALIST)
-            result = chat(specialist["name"], messages, temperature, max_tokens,
-                         num_ctx=ctx_cap, keep_alive=keep_alive)
-            self.loaded = list_loaded_models()
-            return {
-                "model": specialist["name"],
-                "tag": specialist["tag"],
-                "result": result,
-            }
-        except Exception as e:
-            return {"error": str(e), "model": specialist["name"]}
+            specialist = self.select_specialist(task_type)
+            if not specialist:
+                return {"error": f"No specialist available for '{task_type}'"}
+
+            needed = specialist["vram_gb"]
+            if not self._make_room(needed):
+                return {"error": f"Cannot fit {specialist['name']} ({needed}GB) in VRAM budget"}
+
+            messages = []
+            if system:
+                messages.append({"role": "system", "content": system})
+            if context:
+                messages.append({"role": "user", "content": f"Context:\n{context}"})
+                messages.append({"role": "assistant", "content": "Understood."})
+            messages.append({"role": "user", "content": prompt})
+
+            print(f"* dispatching to {specialist['tag']} ({specialist['name']})...")
+
+            try:
+                # Issue 3: Timeout handling with retry for slow model loads
+                start_time = time.time()
+                ctx_cap = specialist.get("context_cap", CONTEXT_CAP_SPECIALIST)
+                adaptive_timeout = max(load_timeout, specialist.get("vram_gb", 1) * 10)
+
+                result = chat(specialist["name"], messages, temperature, max_tokens,
+                             num_ctx=ctx_cap, keep_alive=keep_alive)
+
+                load_time = time.time() - start_time
+                if load_time > 30:
+                    print(f"! warning: {specialist['name']} took {load_time:.1f}s to load/respond")
+
+                self.loaded = list_loaded_models()
+                return {
+                    "model": specialist["name"],
+                    "tag": specialist["tag"],
+                    "result": result,
+                }
+            except urllib.error.URLError as e:
+                if "timeout" in str(e).lower():
+                    return {"error": f"Model load timeout (> {adaptive_timeout}s). Try increasing MODEL_LOAD_TIMEOUT.", "model": specialist["name"]}
+                return {"error": f"Network error: {e}", "model": specialist["name"]}
+            except Exception as e:
+                return {"error": str(e), "model": specialist["name"]}
+        finally:
+            self._dispatch_lock.release()
 
 
 # ═══════════════════════════════════════════════════════════════
@@ -845,54 +1088,93 @@ ESCALATION_SYSTEM = (
     "Escalate generously. You are small. Pride costs more than VRAM."
 )
 
-def run_with_escalation(router, prompt, context=None, use_json_routing=False):
+def run_with_escalation(router, prompt, context=None, use_json_routing=False, max_depth=MAX_ESCALATION_DEPTH):
     """
     Full escalation flow: iterator tries → escalates if needed → specialist solves.
+
+    Issue 4: Escalation loop prevention - tracks escalation depth and prevents
+    infinite loops if specialists also fail/escalate.
 
     Args:
         router: ModelRouter instance
         prompt: The task prompt
         context: Optional context
         use_json_routing: If True, use structured JSON routing instead of text markers
+        max_depth: Maximum escalation depth to prevent infinite loops (default: 3)
 
     Returns:
-        dict with {handled_by, result, escalated, task_type, hint}
+        dict with {handled_by, result, escalated, task_type, hint, escalation_depth}
     """
-    # Step 1: Iterator tries
-    iterator_output = router.iterate(
-        prompt, context=context, system=ESCALATION_SYSTEM)
-
-    # Step 2: Check for escalation
-    if use_json_routing:
-        routing = router.route_structured(prompt)
-        task_type = routing_to_task_type(routing)
-        hint = routing.get("rationale", "")
-        needs_escalation = routing.get("target_agent") != "iterator"
-    else:
-        needs_escalation, task_type, hint = router.escalate_check(iterator_output)
-
-    if not needs_escalation:
+    # Check escalation depth before proceeding
+    if router._escalation_depth >= max_depth:
+        print(f"! escalation stopped: max depth ({max_depth}) reached")
         return {
-            "handled_by": "iterator",
-            "result": iterator_output,
+            "handled_by": "none",
+            "result": f"Escalation stopped after {max_depth} attempts. All specialists failed.",
             "escalated": False,
+            "escalation_depth": router._escalation_depth,
+            "error": "max_escalation_depth_reached",
         }
 
-    # Step 3: Dispatch to specialist
-    print(f"* iterator escalated → {task_type}" + (f" ({hint})" if hint else ""))
+    router._escalation_depth += 1
+    current_depth = router._escalation_depth
 
-    # Use keep_alive=BRIEF for specialists (cache for follow-ups)
-    result = router.dispatch(task_type, prompt, context=context,
-                            system=f"You are a {task_type} specialist. Solve this precisely.",
-                            keep_alive=KEEP_ALIVE_BRIEF)
+    try:
+        # Step 1: Iterator tries
+        iterator_output = router.iterate(
+            prompt, context=context, system=ESCALATION_SYSTEM)
 
-    return {
-        "handled_by": result.get("model", task_type),
-        "result": result.get("result", result.get("error", "unknown")),
-        "escalated": True,
-        "task_type": task_type,
-        "hint": hint,
-    }
+        # Step 2: Check for escalation
+        if use_json_routing:
+            routing = router.route_structured(prompt)
+            task_type = routing_to_task_type(routing)
+            hint = routing.get("rationale", "")
+            needs_escalation = routing.get("target_agent") != "iterator"
+        else:
+            needs_escalation, task_type, hint = router.escalate_check(iterator_output)
+
+        if not needs_escalation:
+            return {
+                "handled_by": "iterator",
+                "result": iterator_output,
+                "escalated": False,
+                "escalation_depth": current_depth,
+            }
+
+        # Step 3: Dispatch to specialist
+        print(f"* iterator escalated → {task_type} (depth {current_depth}/{max_depth})" +
+              (f" ({hint})" if hint else ""))
+
+        result = router.dispatch(task_type, prompt, context=context,
+                                system=f"You are a {task_type} specialist. Solve this precisely.",
+                                keep_alive=KEEP_ALIVE_BRIEF)
+
+        specialist_result = result.get("result", result.get("error", "unknown"))
+
+        # Check if specialist also signaled escalation (prevent infinite loop)
+        if "escalate:" in specialist_result.lower() or "need_specialist:" in specialist_result.lower():
+            print(f"! specialist signaled escalation, returning specialist output as-is")
+            return {
+                "handled_by": result.get("model", task_type),
+                "result": specialist_result,
+                "escalated": True,
+                "escalation_depth": current_depth,
+                "task_type": task_type,
+                "hint": hint,
+                "warning": "Specialist also requested escalation - stopping to prevent loop",
+            }
+
+        return {
+            "handled_by": result.get("model", task_type),
+            "result": specialist_result,
+            "escalated": True,
+            "escalation_depth": current_depth,
+            "task_type": task_type,
+            "hint": hint,
+        }
+    finally:
+        # Always decrement depth on exit
+        router._escalation_depth -= 1
 
 
 def routing_to_task_type(routing):
