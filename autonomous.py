@@ -17,6 +17,8 @@ Resource cost: ~20 MB RSS, near-zero CPU between ticks.
 """
 
 import collections
+import gc
+import flock_gc as gc_module
 import json
 import os
 import re
@@ -111,6 +113,15 @@ DEFAULT_CONFIG = {
             r"^python3 -c\s.+",
         ],
         "execution_timeout": 15,
+    },
+    "gc": {
+        "enabled": True,
+        "run_every_ticks": 120,
+        "max_working_mem_per_goal": 100,
+        "max_stream_lines": 500,
+        "max_audit_age_days": 7,
+        "max_model_disk_gb": 20.0,
+        "keep_model_tags": ["iterator", "coder", "thinker"],
     },
 }
 
@@ -333,6 +344,24 @@ def _validate_config(config):
                 tools_cfg["allowed_patterns"] = DEFAULT_CONFIG["tools"]["allowed_patterns"]
             if not isinstance(tools_cfg.get("execution_timeout"), (int, float)) or tools_cfg.get("execution_timeout", 0) <= 0:
                 tools_cfg["execution_timeout"] = DEFAULT_CONFIG["tools"]["execution_timeout"]
+
+        # Validate gc section
+        if "gc" in config:
+            gc_cfg = config["gc"]
+            if not isinstance(gc_cfg.get("enabled"), (bool, type(None))):
+                gc_cfg["enabled"] = DEFAULT_CONFIG["gc"]["enabled"]
+            if not isinstance(gc_cfg.get("run_every_ticks"), int) or gc_cfg.get("run_every_ticks", 0) <= 0:
+                gc_cfg["run_every_ticks"] = DEFAULT_CONFIG["gc"]["run_every_ticks"]
+            if not isinstance(gc_cfg.get("max_working_mem_per_goal"), int) or gc_cfg.get("max_working_mem_per_goal", 0) <= 0:
+                gc_cfg["max_working_mem_per_goal"] = DEFAULT_CONFIG["gc"]["max_working_mem_per_goal"]
+            if not isinstance(gc_cfg.get("max_stream_lines"), int) or gc_cfg.get("max_stream_lines", 0) <= 0:
+                gc_cfg["max_stream_lines"] = DEFAULT_CONFIG["gc"]["max_stream_lines"]
+            if not isinstance(gc_cfg.get("max_audit_age_days"), (int, float)) or gc_cfg.get("max_audit_age_days", 0) <= 0:
+                gc_cfg["max_audit_age_days"] = DEFAULT_CONFIG["gc"]["max_audit_age_days"]
+            if not isinstance(gc_cfg.get("max_model_disk_gb"), (int, float)) or gc_cfg.get("max_model_disk_gb", 0) <= 0:
+                gc_cfg["max_model_disk_gb"] = DEFAULT_CONFIG["gc"]["max_model_disk_gb"]
+            if not isinstance(gc_cfg.get("keep_model_tags"), list):
+                gc_cfg["keep_model_tags"] = DEFAULT_CONFIG["gc"]["keep_model_tags"]
 
         return config
     except (KeyError, TypeError, AttributeError) as e:
@@ -1011,7 +1040,35 @@ def handle_command(cmd, rules, notes, paused):
         except IOError as e:
             print(f"! error: could not get status: {e}")
         return paused, False
-    print(f"! unknown: {cmd}  (known: !fix !note !step !pause !resume !clear !goal !goals !status !approve !reject)")
+    if cmd == "!gc" or cmd.startswith("!gc "):
+        # Parse optional subcommands: !gc --report, !gc --prune, !gc --dry-run
+        parts = cmd.split()
+        gc_config = config.get("gc", {})
+        results = gc_module.auto_gc(gc_config, dry_run="--dry" in parts)
+        print("* garbage collection results:")
+        for op, result in results.items():
+            if isinstance(result, dict):
+                if "error" in result:
+                    print(f"  {op}: ! {result['error']}")
+                elif "dry_run" in result:
+                    print(f"  {op}: ~ {result['dry_run']}")
+                else:
+                    print(f"  {op}: ✓")
+                    for k, v in result.items():
+                        if k not in ("error", "dry_run"):
+                            print(f"    {k}: {v}")
+            else:
+                print(f"  {op}: {result}")
+        # Also show disk usage summary
+        usage = gc_module.disk_usage_report()
+        print(f"\n* disk usage summary:")
+        print(f"  models: {usage['models_gb']} GB")
+        print(f"  workspace: {usage['workspace_files_mb']} MB")
+        print(f"  logs: {usage['logs_mb']} MB")
+        if usage.get("cache_freed_mb", 0) > 0:
+            print(f"  cache freed: {usage['cache_freed_mb']} MB")
+        return paused, False
+    print(f"! unknown: {cmd}  (known: !fix !note !step !pause !resume !clear !goal !goals !status !gc !approve !reject)")
     return paused, False
 
 # ═══════════════════════════════════════════════════════════════
@@ -1074,6 +1131,7 @@ def main():
     last_workspace_mtime = mtime(WORKSPACE_FILE)
     last_tick_time = time.time()
     last_action = "starting"
+    tick_count = 0  # For GC scheduling
 
     tick_enabled = config["tick"].get("enabled", True)
     tick_interval = config["tick"].get("interval_seconds", AUTONOMOUS_INTERVAL)
@@ -1136,6 +1194,44 @@ def main():
                 (not idle_only or now - last_edit > IDLE_DEBOUNCE * 4)):
 
             last_tick_time = now
+            tick_count += 1
+
+            # ── Garbage collection check (runs periodically) ─────────
+            gc_cfg = config.get("gc", DEFAULT_CONFIG.get("gc", {}))
+            if gc_cfg.get("enabled", True):
+                gc_interval = gc_cfg.get("run_every_ticks", 120)
+                if tick_count % gc_interval == 0 and tick_count > 0:
+                    try:
+                        gc_results = gc_module.auto_gc(gc_cfg, dry_run=False)
+                        # Log summary to tick file and working memory
+                        summary_parts = []
+                        for op, result in gc_results.items():
+                            if isinstance(result, dict) and "error" not in result:
+                                if op == "working_memory":
+                                    removed = result.get("total_removed", 0)
+                                    if removed > 0:
+                                        summary_parts.append(f"gc: working_mem -{removed} records")
+                                elif op == "stream":
+                                    removed = result.get("removed", 0)
+                                    if removed > 0:
+                                        summary_parts.append(f"gc: stream -{removed} lines")
+                                elif op == "audit_log":
+                                    removed = result.get("removed", 0)
+                                    if removed > 0:
+                                        summary_parts.append(f"gc: audit -{removed} entries")
+                                elif op == "goals_archive":
+                                    archived = result.get("archived_count", 0)
+                                    if archived > 0:
+                                        summary_parts.append(f"gc: archived {archived} goals")
+                                elif op == "models_warning":
+                                    summary_parts.append(f"gc: {result['message']}")
+                        if summary_parts:
+                            gc_summary = "; ".join(summary_parts)
+                            print(f"[gc] {gc_summary}")
+                            append_working_memory("gc", gc_summary)
+                            last_action = f"gc: {gc_summary}"
+                    except Exception as e:
+                        print(f"[gc] error during garbage collection: {e}")
 
             try:
                 goals = parse_goals()
